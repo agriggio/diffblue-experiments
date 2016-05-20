@@ -199,6 +199,7 @@ def main():
     index_set = {}
     cur = assertions
     i = 1
+    seen = set()
 
     while True:
         print('; iteration %d...' % i)
@@ -216,8 +217,9 @@ def main():
             for e in index_set[s]:
                 for axiom in quantified:
                     inst = instantiate(axiom, s, e)
-                    if inst is not None:
+                    if inst is not None and inst not in seen:
                         cur.append(inst)
+                        seen.add(inst)
 
         print('; adding %d instantiations...' % len(cur))
 
