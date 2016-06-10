@@ -2,19 +2,35 @@
 Experimenting with a PASS-like strategy for solving string constraints as
 quantified arrays with lengths
 
-Requires the "array" branch of pySMT available at:
-https://github.com/agriggio/pysmt
+Requires pySMT: https://github.com/pysmt/pysmt
 """
 
 import os, sys
 from six.moves import cStringIO # Py2-Py3 Compatibility
 from pysmt.smtlib.parser import SmtLibParser
 from pysmt.smtlib.printers import SmtPrinter, SmtDagPrinter
+from pysmt.smtlib import commands
 from pysmt.shortcuts import *
 import time
+import argparse
 
 
 STRING_LEN = 'cprover.str.len'
+VERBOSITY = 0
+
+def msg(lvl, fmt, *args):
+    if VERBOSITY >= lvl:
+        print(fmt % tuple(args))
+
+def info(fmt, *args):
+    msg(1, fmt, *args)
+
+def debug(fmt, *args):
+    msg(2, fmt, *args)
+
+def show(fmt, *args):
+    msg(0, fmt, *args)
+    
 
 def get_index_set(formula):
     qvar = None
@@ -147,16 +163,20 @@ def instantiate(axiom, s, e):
         return ret.simplify()
 
     r = getsub(f)
-    print('computed substitution: %s -> %s' % (to_smt(qvar), to_smt(r)))
+    debug('computed substitution: %s -> %s', to_smt(qvar), to_smt(r))
     return Implies(axiom.arg(0).substitute({qvar : r}),
                    body.substitute({qvar : r}))
 
 
-def to_smt(f):
-    buf = cStringIO()
-    p = SmtPrinter(buf)
-    p.printer(f)
-    return buf.getvalue()
+class to_smt(object):
+    def __init__(self, f):
+        self.f = f
+
+    def __str__(self):
+        buf = cStringIO()
+        p = SmtPrinter(buf)
+        p.printer(self.f)
+        return buf.getvalue()
 
 
 def collect_terms(formula, test):
@@ -189,12 +209,12 @@ def get_ground_model(ground, cur):
     for g in ground:
         solver.add_assertion(g)
     for g in cur:
-        print('; adding instantiation: %s' % to_smt(g))
+        debug('; adding instantiation: %s', to_smt(g))
         solver.add_assertion(g)
     start = time.time()
     res = solver.solve()
     end = time.time()
-    print('; solving time: %.3f' % (end - start))
+    info('; solving time: %.3f' % (end - start))
     if res:
         return solver.get_model()
     else:
@@ -208,39 +228,39 @@ def is_good(model, strings, flags, quantified):
         l = model.get_value(slen)
         s = slen.arg(0)
         v = model.get_value(s)
-        print('; string: %s --> %s' % (to_smt(s), to_smt(v)))
-        print('; length: %s --> %s\n' % (to_smt(slen), l.constant_value()))
+        debug('; string: %s --> %s', to_smt(s), to_smt(v))
+        debug('; length: %s --> %s', to_smt(slen), l.constant_value())
         fmodel = And(fmodel, And(Equals(slen, l), Equals(s, v)))
         smodel.append((s, l, v))
     for f in flags:
         b = model.get_value(f)
-        print('; flag: %s --> %s' % (to_smt(f), b.constant_value()))
+        debug('; flag: %s --> %s', to_smt(f), b.constant_value())
         fmodel = And(fmodel, Iff(f, b))
     violated = []
     start = time.time()
     for i, axiom in enumerate(quantified):
         assert axiom.is_forall()
-        print('; checking validity of axiom %d' % i)
+        debug('; checking validity of axiom %d', i)
         m = get_model(And(fmodel, Not(axiom.arg(0))))
         if m is None:
-            print(';  axiom is valid')
+            debug(';  axiom is valid')
         else:
-            print(';  axiom is NOT valid: %s\n;  witness:' % to_smt(axiom))
+            debug(';  axiom is NOT valid: %s\n;  witness:', to_smt(axiom))
             v = axiom.quantifier_vars()[0]
             val = m.get_value(v)
-            print(';      %s --> %s' % (to_smt(v), val.constant_value()))
+            debug(';      %s --> %s', to_smt(v), val.constant_value())
             violated.append((v, val, axiom))
     end = time.time()
-    print('; checked axioms in %.3f seconds, %d violated' % \
-          ((end - start), len(violated)))
+    info('; checked %d axioms in %.3f seconds, %d violated',
+         len(quantified), (end - start), len(violated))
     if len(violated) == 0:
         return True, smodel
     else:
         return False, violated
 
 
-def print_model(model, strings):
-    print('MODEL')
+def show_model(model, strings):
+    show('MODEL')
     def getch(v, i):
         f = Select(s, BV(i, 32))
         b = model.get_value(f)
@@ -249,18 +269,19 @@ def print_model(model, strings):
     seen = set()
     for (s, l, v) in strings:
         val = "".join(getch(s, i) for i in xrange(l.constant_value()))
-        print('  %s := "%s"' % (to_smt(s), val.replace('"', '\\"')))
+        show('  %s := "%s"', to_smt(s), val.replace('"', '\\"'))
         seen.add(s)
     for (var, value) in model:
         if var not in seen:
-            print('  %s := %s' % (to_smt(var), value))
+            show('  %s := %s', to_smt(var), value)
 
-def main():
+def main(opts):
+    start = time.time()
     parser = SmtLibParser()
     script = parser.get_script(sys.stdin)
 
     assertions = [cmd.args[0]
-                  for cmd in script.filter_by_command_name("assert")]
+                  for cmd in script.filter_by_command_name(commands.ASSERT)]
 
     ground, quantified = [], []
     strings = set()
@@ -274,8 +295,8 @@ def main():
             ground.append(f)
         strings |= collect_strings(f)
 
-    print('; Got %d assertions, %d ground and %d quantified, and %d strings' % \
-          (len(assertions), len(ground), len(quantified), len(strings)))
+    info('; Got %d assertions, %d ground and %d quantified, and %d strings',
+         len(assertions), len(ground), len(quantified), len(strings))
 
     index_set = {}
     cur = assertions
@@ -283,10 +304,10 @@ def main():
     seen = set()
 
     while True:
-        print('; iteration %d...' % i)
+        info('; iteration %d...', i)
         i += 1
 
-        print('; computing index set from %d formulas' % len(cur))
+        info('; computing index set from %d formulas', len(cur))
         index_set = {}
         for formula in cur:
             d = get_index_set(formula)
@@ -302,24 +323,51 @@ def main():
                         cur.append(inst)
                         seen.add(inst)
 
-        print('; adding %d instantiations...' % len(cur))
+        info('; adding %d instantiations...', len(cur))
 
         model = get_ground_model(ground, cur)
         if model is None:
-            print("unsat")
+            show("unsat")
             break
         else:
-            ok, info = is_good(model, strings, flags, quantified)
+            ok, extra = is_good(model, strings, flags, quantified)
             if ok:
-                print_model(model, info)
-                print("sat")
+                if VERBOSITY > 0:
+                    show_model(model, extra)
+                show("sat")
+                if opts.get_values:
+                    for cmd in \
+                            script.filter_by_command_name(commands.GET_VALUE):
+                        try:
+                            vals = ["(%s %s)" % (to_smt(t),
+                                                 to_smt(model.get_value(t)))
+                                    for t in cmd.args]
+                            show("(%s)", " ".join(vals))
+                        except Exception, e:
+                            show('(error "%s")', str(e).replace('"', '\\"'))
                 break
             else:
-                for (qv, v, axiom) in info:
-                    cur.append(axiom.arg(0).substitute({qv : v}))
+                for (qv, v, axiom) in extra:
+                    inst = axiom.arg(0).substitute({qv : v})
+                    if inst not in seen:
+                        cur.append(inst)
+                        seen.add(inst)
 
         ground += cur
+    end = time.time()
+    info("; total time: %.3f", (end - start))
 
+
+def getopts():
+    p = argparse.ArgumentParser()
+    p.add_argument('--verbosity', type=int, help='set verbosity level',
+                   default=1)
+    p.add_argument('--get-values', action='store_true',
+                   help='evalate the get-value commands if the result is sat')
+    ret = p.parse_args()
+    global VERBOSITY
+    VERBOSITY = ret.verbosity
+    return ret
 
 if __name__ == '__main__':
-    main()
+    main(getopts())
