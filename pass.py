@@ -14,6 +14,8 @@ from pysmt.shortcuts import *
 import time
 
 
+STRING_LEN = 'cprover.str.len'
+
 def get_index_set(formula):
     qvar = None
     if formula.is_forall():
@@ -64,7 +66,7 @@ def get_index_set(formula):
         if cur in seen:
             continue
         seen.add(cur)
-        if cur.is_arr_select():
+        if cur.is_select():
             s = cur.arg(0)
             i = cur.arg(1)
             if not has_qvar(i):
@@ -87,7 +89,7 @@ def instantiate(axiom, s, e):
     while to_process:
         cur = to_process[-1]
         to_process.pop()
-        if cur.is_arr_select():
+        if cur.is_select():
             if cur.arg(0) == s:
                 i = cur.arg(1)
                 if qvar in i.get_free_variables():
@@ -157,7 +159,32 @@ def to_smt(f):
     return buf.getvalue()
 
 
-def get_model(ground, cur):
+def collect_terms(formula, test):
+    ret = set()
+    seen = set()
+    to_process = [formula]
+    while to_process:
+        cur = to_process[-1]
+        to_process.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if test(cur):
+            ret.add(cur)
+        to_process += cur.args()
+    return ret
+
+
+def collect_strings(formula):
+    return collect_terms(formula,
+                         lambda cur: cur.is_function_application() and \
+                         cur.function_name().symbol_name() == STRING_LEN)
+
+def collect_flags(formula):
+    return collect_terms(formula, lambda cur: cur.is_symbol(types.BOOL))
+
+
+def get_ground_model(ground, cur):
     solver = Solver()
     for g in ground:
         solver.add_assertion(g)
@@ -174,9 +201,59 @@ def get_model(ground, cur):
         return None
 
 
-def is_good(model, quantified):
-    return False # TODO
+def is_good(model, strings, flags, quantified):
+    fmodel = TRUE()
+    smodel = []
+    for slen in strings:
+        l = model.get_value(slen)
+        s = slen.arg(0)
+        v = model.get_value(s)
+        print('; string: %s --> %s' % (to_smt(s), to_smt(v)))
+        print('; length: %s --> %s\n' % (to_smt(slen), l.constant_value()))
+        fmodel = And(fmodel, And(Equals(slen, l), Equals(s, v)))
+        smodel.append((s, l, v))
+    for f in flags:
+        b = model.get_value(f)
+        print('; flag: %s --> %s' % (to_smt(f), b.constant_value()))
+        fmodel = And(fmodel, Iff(f, b))
+    violated = []
+    start = time.time()
+    for i, axiom in enumerate(quantified):
+        assert axiom.is_forall()
+        print('; checking validity of axiom %d' % i)
+        m = get_model(And(fmodel, Not(axiom.arg(0))))
+        if m is None:
+            print(';  axiom is valid')
+        else:
+            print(';  axiom is NOT valid: %s\n;  witness:' % to_smt(axiom))
+            v = axiom.quantifier_vars()[0]
+            val = m.get_value(v)
+            print(';      %s --> %s' % (to_smt(v), val.constant_value()))
+            violated.append((v, val, axiom))
+    end = time.time()
+    print('; checked axioms in %.3f seconds, %d violated' % \
+          ((end - start), len(violated)))
+    if len(violated) == 0:
+        return True, smodel
+    else:
+        return False, violated
 
+
+def print_model(model, strings):
+    print('MODEL')
+    def getch(v, i):
+        f = Select(s, BV(i, 32))
+        b = model.get_value(f)
+        c = b.constant_value()
+        return chr(c)
+    seen = set()
+    for (s, l, v) in strings:
+        val = "".join(getch(s, i) for i in xrange(l.constant_value()))
+        print('  %s := "%s"' % (to_smt(s), val.replace('"', '\\"')))
+        seen.add(s)
+    for (var, value) in model:
+        if var not in seen:
+            print('  %s := %s' % (to_smt(var), value))
 
 def main():
     parser = SmtLibParser()
@@ -186,15 +263,19 @@ def main():
                   for cmd in script.filter_by_command_name("assert")]
 
     ground, quantified = [], []
+    strings = set()
+    flags = set()
     for f in assertions:
         if f.is_forall():
             assert f.arg(0).is_implies(), f
             quantified.append(f)
+            flags |= collect_flags(f)
         else:
             ground.append(f)
+        strings |= collect_strings(f)
 
-    print('; Got %d assertions, %d ground and %d quantified' % \
-          (len(assertions), len(ground), len(quantified)))
+    print('; Got %d assertions, %d ground and %d quantified, and %d strings' % \
+          (len(assertions), len(ground), len(quantified), len(strings)))
 
     index_set = {}
     cur = assertions
@@ -223,13 +304,19 @@ def main():
 
         print('; adding %d instantiations...' % len(cur))
 
-        model = get_model(ground, cur)
+        model = get_ground_model(ground, cur)
         if model is None:
             print("unsat")
             break
-        elif is_good(model, quantified):
-            print("sat")
-            break
+        else:
+            ok, info = is_good(model, strings, flags, quantified)
+            if ok:
+                print_model(model, info)
+                print("sat")
+                break
+            else:
+                for (qv, v, axiom) in info:
+                    cur.append(axiom.arg(0).substitute({qv : v}))
 
         ground += cur
 
