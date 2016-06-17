@@ -11,6 +11,7 @@ from pysmt.smtlib.parser import SmtLibParser
 from pysmt.smtlib.printers import SmtPrinter, SmtDagPrinter
 from pysmt.smtlib import commands
 from pysmt.shortcuts import *
+from pysmt import logics
 import time
 import argparse
 
@@ -204,10 +205,11 @@ def collect_flags(formula):
     return collect_terms(formula, lambda cur: cur.is_symbol(types.BOOL))
 
 
-def get_ground_model(ground, cur):
-    solver = Solver()
-    for g in ground:
-        solver.add_assertion(g)
+def get_ground_model(solver, ground, cur):
+    #solver = Solver()
+    #solver.push()
+    ## for g in ground:
+    ##     solver.add_assertion(g)
     for g in cur:
         debug('; adding instantiation: %s', to_smt(g))
         solver.add_assertion(g)
@@ -215,13 +217,14 @@ def get_ground_model(ground, cur):
     res = solver.solve()
     end = time.time()
     info('; solving time: %.3f' % (end - start))
+    m = None
     if res:
-        return solver.get_model()
-    else:
-        return None
+        m = solver.get_model()
+    #solver.pop()
+    return m
 
 
-def is_good(model, strings, flags, quantified):
+def is_good(solver, model, strings, flags, quantified):
     fmodel = TRUE()
     smodel = []
     for slen in strings:
@@ -238,10 +241,18 @@ def is_good(model, strings, flags, quantified):
         fmodel = And(fmodel, Iff(f, b))
     violated = []
     start = time.time()
+    solver.reset_assertions()
+    solver.add_assertion(fmodel)
     for i, axiom in enumerate(quantified):
         assert axiom.is_forall()
         debug('; checking validity of axiom %d', i)
-        m = get_model(And(fmodel, Not(axiom.arg(0))))
+        solver.push()
+        f = Not(axiom.arg(0))
+        solver.add_assertion(f)
+        if solver.solve():
+            m = solver.get_model()
+        else:
+            m = None
         if m is None:
             debug(';  axiom is valid')
         else:
@@ -250,6 +261,7 @@ def is_good(model, strings, flags, quantified):
             val = m.get_value(v)
             debug(';      %s --> %s', to_smt(v), val.constant_value())
             violated.append((v, val, axiom))
+        solver.pop()
     end = time.time()
     info('; checked %d axioms in %.3f seconds, %d violated',
          len(quantified), (end - start), len(violated))
@@ -268,8 +280,17 @@ def show_model(model, strings):
         return chr(c)
     seen = set()
     for (s, l, v) in strings:
-        val = "".join(getch(s, i) for i in xrange(l.constant_value()))
-        show('  %s := "%s"', to_smt(s), val.replace('"', '\\"'))
+        n = l.constant_value()
+        if n is None:
+            show('  WARNING: no value for %s', to_smt(s))
+        else:
+            if n > 50:
+                extra = "[...] (50 of %d chars shown)" % n
+                n = 50
+            else:
+                extra = ""
+            val = "".join(getch(s, i) for i in xrange(n))
+            show('  %s := "%s"%s', to_smt(s), val.replace('"', '\\"'), extra)
         seen.add(s)
     for (var, value) in model:
         if var not in seen:
@@ -278,7 +299,8 @@ def show_model(model, strings):
 def main(opts):
     start = time.time()
     parser = SmtLibParser()
-    script = parser.get_script(sys.stdin)
+    with open(opts.filename) as src:
+        script = parser.get_script(src)
 
     assertions = [cmd.args[0]
                   for cmd in script.filter_by_command_name(commands.ASSERT)]
@@ -303,6 +325,12 @@ def main(opts):
     i = 1
     seen = set()
 
+    mainsolver = Solver(name=opts.solver, logic=logics.QF_AUFBV)
+    modelsolver = Solver(name=opts.solver, logic=logics.QF_AUFBV)
+
+    for g in ground:
+        mainsolver.add_assertion(g)
+
     while True:
         info('; iteration %d...', i)
         i += 1
@@ -325,12 +353,12 @@ def main(opts):
 
         info('; adding %d instantiations...', len(cur))
 
-        model = get_ground_model(ground, cur)
+        model = get_ground_model(mainsolver, ground, cur)
         if model is None:
             show("unsat")
             break
         else:
-            ok, extra = is_good(model, strings, flags, quantified)
+            ok, extra = is_good(modelsolver, model, strings, flags, quantified)
             if ok:
                 if VERBOSITY > 0:
                     show_model(model, extra)
@@ -352,6 +380,7 @@ def main(opts):
                     if inst not in seen:
                         cur.append(inst)
                         seen.add(inst)
+                        mainsolver.add_assertion(inst)
 
         ground += cur
     end = time.time()
@@ -364,10 +393,15 @@ def getopts():
                    default=1)
     p.add_argument('--get-values', action='store_true',
                    help='evalate the get-value commands if the result is sat')
+    solvers = sorted(get_env().factory.all_solvers(logics.QF_AUFBV).keys())
+    p.add_argument('--solver', help='set the underlying solver to use',
+                   choices=solvers)
+    p.add_argument('filename', help='input file')
     ret = p.parse_args()
     global VERBOSITY
     VERBOSITY = ret.verbosity
     return ret
 
 if __name__ == '__main__':
+    #raw_input('enter... %d: ' % os.getpid())
     main(getopts())
