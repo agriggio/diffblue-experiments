@@ -296,6 +296,37 @@ def show_model(model, strings):
         if var not in seen:
             show('  %s := %s', to_smt(var), value)
 
+
+_strcache = {}
+def get_instances(opts, model, strings, qv, v, axiom):
+    inst = axiom.arg(0).substitute({qv : v})
+    yield inst
+    if opts.inst_idx_bwd:
+        if axiom not in _strcache:
+            to_process = [axiom.arg(0)]
+            seen = set()
+            while to_process:
+                cur = to_process[-1]
+                to_process.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                if cur.is_select():
+                    s = cur.arg(0)
+                    for slen in strings:
+                        s2 = slen.arg(0)
+                        if s == s2:
+                            _strcache.setdefault(axiom, set()).add(slen)
+                to_process += cur.args()
+            _strcache[axiom] = sorted(_strcache[axiom])
+
+        for slen in _strcache[axiom]:
+            l = model.get_value(slen)
+            if l.constant_value() >= v.constant_value():
+                w = l.get_type().width
+                vv = BVSub(slen, BVSub(l, v))
+                yield axiom.arg(0).substitute({qv : vv})
+
 def main(opts):
     start = time.time()
     parser = SmtLibParser()
@@ -376,11 +407,17 @@ def main(opts):
                 break
             else:
                 for (qv, v, axiom) in extra:
-                    inst = axiom.arg(0).substitute({qv : v})
-                    if inst not in seen:
-                        cur.append(inst)
-                        seen.add(inst)
-                        mainsolver.add_assertion(inst)
+                    for inst in get_instances(opts,
+                                              model, strings, qv, v, axiom):
+                        if inst not in seen:
+                            cur.append(inst)
+                            seen.add(inst)
+                            mainsolver.add_assertion(inst)
+                    ## inst = axiom.arg(0).substitute({qv : v})
+                    ## if inst not in seen:
+                    ##     cur.append(inst)
+                    ##     seen.add(inst)
+                    ##     mainsolver.add_assertion(inst)
 
         ground += cur
     end = time.time()
@@ -396,6 +433,11 @@ def getopts():
     solvers = sorted(get_env().factory.all_solvers(logics.QF_AUFBV).keys())
     p.add_argument('--solver', help='set the underlying solver to use',
                    choices=solvers)
+    p.add_argument('--inst-idx-bwd', action='store_true',
+                   help='if true, add extra axiom instances by generating '
+                   'things like (bvsub (str.len s) idx)', default=False)
+    p.add_argument('--no-inst-idx-bwd', action='store_false',
+                   dest='inst_idx_bwd')
     p.add_argument('filename', help='input file')
     ret = p.parse_args()
     global VERBOSITY
